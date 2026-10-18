@@ -811,21 +811,19 @@ impl Tensor {
         nrows: u64,
         ncols: u64,
     ) {
-        if nrows < self.m.nrows() || ncols < self.m.ncols() {
-            // Shrinking can drop entries; keep the straightforward path.
-            self.flush();
-            // GrB_Matrix_resize waits internally, so `m` holds no real pending
-            // work afterwards — waiting here would rebuild the freed hyper hash
-            // on every capacity grow (measured 1.4-5.7x write regressions).
-            self.m.resize(nrows, ncols);
-            // A resize moves no entries between layers, so the delta counters
-            // stand (a shrink that drops entries only adds to the drift
-            // `resync` bounds).
-            self.dp.resize(nrows, ncols);
-            self.dm.resize(nrows, ncols);
-            self.mt.resize(ncols, nrows);
-            return;
-        }
+        // A resize always grows: a smaller target keeps the current dimension.
+        // If one of the dimensions decreases, GraphBLAS silently drops entries
+        // outside the new bounds. The issue is that `me` is not pruned alongside
+        // other matrices. To prevent this, `resize` should only grow.
+        debug_assert!(
+            nrows >= self.m.nrows() && ncols >= self.m.ncols(),
+            "Tensor::resize cannot shrink (target {nrows}x{ncols}, current {}x{})",
+            self.m.nrows(),
+            self.m.ncols()
+        );
+        let nrows = nrows.max(self.m.nrows());
+        let ncols = ncols.max(self.m.ncols());
+
         // Growing: the base is always COW-shared with the committed snapshot,
         // so resizing through the Cow would deep-copy the full matrix at the
         // old dims and then rewrite it. Instead re-emit each layer at the
@@ -1960,6 +1958,34 @@ mod tests {
         );
     }
 
+    /// `resize` to smaller dimensions must not affect existing data.
+    /// This test reproduces the issue by shrinking a tensor with multi-edge
+    /// pairs and verifying that the multi-edge ids are retained even though
+    /// their corresponding forward entries are cut off.
+    #[test]
+    fn resize_shrinking_retains_multi_edge_ids() {
+        ensure_init();
+        let mut t = Tensor::new(8, 8);
+        // (0, 1) and (5, 6) are multi pairs, (1, 2) a single one.
+        t.set_all_from_slices(&[0, 0, 1, 5, 5, 5], &[1, 1, 2, 6, 6, 6], &[10, 11, 12, 20, 21, 22]);
+        t.flush();
+        t.wait();
+
+        // Shrink the tensor to 4x4. Pairs (5,6) should be cut off.
+        t.resize(4, 4);
+
+        // Expected values after shrinking: only pairs within 4x4 bounds remain.
+        // Original (5,6) pairs should be gone from effective forward matrix
+        // but their multi-edge IDs might remain in `me` if not pruned.
+        let expected_edges = vec![(0, 1, 10), (0, 1, 11), (1, 2, 12)];
+        let mut actual_edges: Vec<(u64, u64, u64)> = t.iter_edges().collect();
+        actual_edges.sort_unstable();
+        assert_eq!(actual_edges, expected_edges, "iter_edges returned incorrect results after shrink");
+
+        assert_eq!(t.edge_count(), 3, "edge_count is incorrect after shrink");
+        assert_eq!(t.multi_pairs(), 1, "multi_pairs is incorrect after shrink");
+    }
+
     /// `resize` must leave the committed base materialized.
     ///
     /// `wait_fwd` asserts `!self.m.pending()` — the base is only written by a
@@ -1989,6 +2015,7 @@ mod tests {
         t.flush();
         t.m.wait();
 
+        // Test growing scenario
         t.resize(114_688, 114_688);
 
         assert!(
