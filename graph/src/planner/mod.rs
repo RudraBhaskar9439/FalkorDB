@@ -716,6 +716,17 @@ fn has_labels_filter(
 /// - `scope_vars` holds the binder-assigned variables grouped by scope ID,
 ///   used to mint fresh variable IDs for synthetic variables introduced
 ///   during pattern-predicate decomposition without collisions.
+///
+/// # Memory Capacity Enforcement
+///
+/// The planner performs constant folding during plan construction (e.g.,
+/// `AR_EXP_ReduceToScalar` for constant expressions like `range(1, 50000000)`),
+/// which can allocate large amounts of memory before the execution-time
+/// exception handler is armed. To prevent OOM kills when `QUERY_MEM_CAPACITY`
+/// is set, the planner should be invoked within an exception handler that
+/// can catch and unwind capacity violations during plan-time allocations.
+/// The allocator (src/allocator.rs) propagates allocation failures from
+/// RedisAlloc, allowing the exception handler to catch them.
 #[derive(Default)]
 pub struct Planner {
     /// Variable (id, scope_id) pairs that are already bound in the current

@@ -45,6 +45,12 @@ unsafe impl GlobalAlloc for ThreadCountingAllocator {
         &self,
         layout: Layout,
     ) -> *mut u8 {
+        // Pre-check capacity before requesting memory from the system allocator.
+        // This prevents OOM kills when QUERY_MEM_CAPACITY is set.
+        // The actual limit check is delegated to RedisAlloc, which has access
+        // to the per-query capacity configuration. If RedisAlloc enforces the
+        // limit by returning null, we propagate that to the caller, allowing
+        // the exception handler to unwind instead of the process being killed.
         let ptr = unsafe {
             redis_module::alloc::RedisAlloc::alloc(&redis_module::alloc::RedisAlloc, layout)
         };
