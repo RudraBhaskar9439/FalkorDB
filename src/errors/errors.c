@@ -102,6 +102,20 @@ void ErrorCtx_RaiseRuntimeException
 	}
 }
 
+// Disarm the current exception breakpoint without clearing any set error.
+// Bounds a SET_EXCEPTION_HANDLER() to a specific phase so a subsequent raise
+// (e.g. an over-capacity allocation in a later phase) does not longjmp into a
+// stack frame that has already returned.
+void ErrorCtx_ClearBreakpoint(void) {
+	ErrorCtx *ctx = ErrorCtx_Get();
+	ASSERT(ctx != NULL);
+
+	if(ctx->breakpoint != NULL) {
+		rm_free(ctx->breakpoint);
+		ctx->breakpoint = NULL;
+	}
+}
+
 // Reply to caller with error
 void ErrorCtx_EmitException(void) {
 	ErrorCtx *ctx = ErrorCtx_Get();

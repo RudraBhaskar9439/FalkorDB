@@ -44,6 +44,11 @@ void ErrorCtx_SetError(const char *err_fmt, ...);
 // Jump to a runtime exception breakpoint if one has been set
 void ErrorCtx_RaiseRuntimeException(const char *err_fmt, ...);
 
+// Disarm the current exception breakpoint (without touching any set error),
+// so a later raise does not longjmp into a stack frame that has returned.
+// Used to bound the lifetime of a SET_EXCEPTION_HANDLER() to a specific phase.
+void ErrorCtx_ClearBreakpoint(void);
+
 // Reply back to the user with error
 void ErrorCtx_EmitException(void);
 

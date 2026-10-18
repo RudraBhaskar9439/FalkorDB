@@ -181,6 +181,26 @@ ExecutionCtx *ExecutionCtx_FromQuery
 		//----------------------------------------------------------------------
 		// build execution-plan
 		//----------------------------------------------------------------------
+
+		// Arm an exception breakpoint for the plan-construction phase.
+		// Constant sub-expressions (e.g. the list in UNWIND range(1, 5e7)) are
+		// folded to a scalar during plan construction / compile-time
+		// optimization - long before ExecutionPlan_Execute installs its own
+		// handler. Without a breakpoint here the allocator's memory-capacity
+		// guard cannot unwind an oversized allocation, so the process would be
+		// OOM-killed instead of the query failing cleanly.
+		// 'ast' is declared volatile so its value survives the longjmp and can
+		// be freed on the abort path.
+		AST *volatile ast_v = ast ;
+		if (SET_EXCEPTION_HANDLER ()) {
+			// an over-capacity (or other runtime) exception was raised while
+			// building the plan; disarm before leaving this frame so a later
+			// raise cannot jump back into it
+			ErrorCtx_ClearBreakpoint () ;
+			AST_Free (ast_v) ;
+			return NULL ;
+		}
+
 		ExecutionPlan *plan = ExecutionPlan_FromTLS_AST () ;
 
 		// TODO: there must be a better way to understand if the execution-plan
@@ -190,6 +210,7 @@ ExecutionCtx *ExecutionCtx_FromQuery
 		if (ErrorCtx_EncounteredError ()) {
 			// failed to construct plan
 			// clean up and return NULL
+			ErrorCtx_ClearBreakpoint () ;
 			AST_Free (ast) ;
 
 			if (plan != NULL) {
@@ -201,6 +222,10 @@ ExecutionCtx *ExecutionCtx_FromQuery
 
 		// apply compile time optimizations
 		Optimizer_CompileTimeOptimize (plan) ;
+
+		// plan construction + compile-time optimization complete; disarm the
+		// breakpoint so a raise in a later phase does not jump back here
+		ErrorCtx_ClearBreakpoint () ;
 
 		// remember if query is deterministic
 		ExecutionCtx *exec_ctx = _ExecutionCtx_New (ast, plan, exec_type,
