@@ -811,20 +811,21 @@ impl Tensor {
         nrows: u64,
         ncols: u64,
     ) {
-        if nrows < self.m.nrows() || ncols < self.m.ncols() {
-            // Shrinking can drop entries; keep the straightforward path.
-            self.flush();
-            // GrB_Matrix_resize waits internally, so `m` holds no real pending
-            // work afterwards — waiting here would rebuild the freed hyper hash
-            // on every capacity grow (measured 1.4-5.7x write regressions).
-            self.m.resize(nrows, ncols);
-            // A resize moves no entries between layers, so the delta counters
-            // stand (a shrink that drops entries only adds to the drift
-            // `resync` bounds).
-            self.dp.resize(nrows, ncols);
-            self.dm.resize(nrows, ncols);
-            self.mt.resize(ncols, nrows);
-            return;
+        // Tensors never shrink: a smaller target keeps the current dimension.
+        // Shrinking would drop forward entries outside the new bounds while
+        // leaving their multi-edge ids in `me`, causing phantom edges (issue
+        // #3246). The RDB load only grows matrices instead.
+        let nrows = nrows.max(self.m.nrows());
+        let ncols = ncols.max(self.m.ncols());
+        debug_assert!(
+            nrows >= self.m.nrows() && ncols >= self.m.ncols(),
+            "Tensor::resize must not shrink: requested ({nrows}, {ncols}) \
+             but current is ({}, {})",
+            self.m.nrows(),
+            self.m.ncols()
+        );
+        if nrows == self.m.nrows() && ncols == self.m.ncols() {
+            return; // Already at target or larger
         }
         // Growing: the base is always COW-shared with the committed snapshot,
         // so resizing through the Cow would deep-copy the full matrix at the
@@ -1960,6 +1961,54 @@ mod tests {
         );
     }
 
+    /// Resizing to a smaller dimension keeps the current dimension instead,
+    /// preventing multi-edge ids in `me` from becoming orphaned (issue #3246).
+    /// A tensor never shrinks; only grows or stays the same.
+    #[test]
+    fn resize_never_shrinks() {
+        ensure_init();
+        const N: u64 = 1000;
+        let mut t = Tensor::new(N, N);
+        let srcs: Vec<u64> = (0..N).collect();
+        let dsts: Vec<u64> = (0..N).map(|i| i + 1).collect();
+        let ids: Vec<u64> = (0..N).collect();
+        t.set_all_from_slices(&srcs, &dsts, &ids);
+        t.flush();
+        t.wait();
+
+        let before_nrows = t.fwd_m().nrows();
+        let before_ncols = t.fwd_m().ncols();
+        let before_edge_count = t.edge_count();
+
+        // Attempt to shrink to a smaller dimension.
+        t.resize(500, 500);
+
+        // Dimensions must not shrink; they stay the same.
+        assert_eq!(
+            t.fwd_m().nrows(),
+            before_nrows,
+            "resize shrunk nrows despite grow-only policy"
+        );
+        assert_eq!(
+            t.fwd_m().ncols(),
+            before_ncols,
+            "resize shrunk ncols despite grow-only policy"
+        );
+        // All edges must still be present and readable.
+        assert_eq!(
+            t.edge_count(),
+            before_edge_count,
+            "edges lost when resize was prevented from shrinking"
+        );
+        for i in 0..N {
+            let dst = i + 1;
+            assert!(
+                t.get(i, dst).next().is_some(),
+                "edge ({i}, {dst}) lost after resize refusal"
+            );
+        }
+    }
+
     /// `resize` must leave the committed base materialized.
     ///
     /// `wait_fwd` asserts `!self.m.pending()` — the base is only written by a
@@ -2115,6 +2164,43 @@ mod tests {
         );
         assert_eq!(t.edge_count(), 5, "edge count after in-batch promotion");
         assert_eq!(t.multi_pairs(), 2, "both pairs should read as multi");
+    }
+
+    /// Regression test for issue #3246: when resizing to smaller dimensions,
+    /// forward entries are dropped but multi-edge ids in `me` remain, causing
+    /// phantom edges with no forward entry to show in `iter_edges` and
+    /// `edge_count`. The fix makes resize grow-only.
+    #[test]
+    fn resize_shrinking_does_not_orphan_multi_edge_ids() {
+        ensure_init();
+        let mut t = Tensor::new(8, 8);
+        // (0, 1) and (5, 6) are multi pairs, (1, 2) a single one.
+        t.set_all_from_slices(&[0, 0, 1, 5, 5, 5], &[1, 1, 2, 6, 6, 6], &[10, 11, 12, 20, 21, 22]);
+        t.flush();
+        t.wait();
+
+        let before = (
+            t.iter_edges().count(),
+            t.edge_count(),
+            t.multi_pairs(),
+        );
+
+        // Resize to smaller dimensions (this should not actually shrink).
+        t.resize(4, 4);
+        t.wait();
+
+        let after = (
+            t.iter_edges().count(),
+            t.edge_count(),
+            t.multi_pairs(),
+        );
+
+        // Since resize is now grow-only, dimensions stay the same and all
+        // edges remain, so the counts should match before and after.
+        assert_eq!(before, after, "edges changed after resize refusal");
+        assert_eq!(after.0, 6, "iter_edges count should be 6");
+        assert_eq!(after.1, 6, "edge_count should be 6");
+        assert_eq!(after.2, 2, "multi_pairs should be 2");
     }
 
     /// The case that makes the in-batch promotion more than a duplicate-key
